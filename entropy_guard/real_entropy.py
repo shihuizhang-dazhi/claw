@@ -68,7 +68,15 @@ def extract_real_entropies(
     """
     import os
 
-    client = SiliconFlowClient(model=model)
+    from agent_eval.llm_client import OpenAIClient, SiliconFlowClient
+
+    # Use OpenAI for real logprobs; fall back to SiliconFlow if no OpenAI key
+    if os.environ.get("OPENAI_API_KEY"):
+        client = OpenAIClient(model="gpt-4o-mini")
+        print("[RealEntropy] Using OpenAI (logprobs supported)")
+    else:
+        client = SiliconFlowClient(model=model)
+        print("[RealEntropy] Using SiliconFlow (WARNING: logprobs may not be supported)")
 
     if max_samples is not None:
         samples = samples[:max_samples]

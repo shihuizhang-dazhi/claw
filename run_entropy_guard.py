@@ -18,6 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from claw_trojan.loader import load_all_trojan_envs
 from entropy_guard.entropy_channel import EntropyMonitor
 from entropy_guard.fusion import EntropyGuardDetector

@@ -79,15 +79,18 @@ fi
 # =========================================================================
 log "========== STEP 3: 安装依赖 =========="
 
-pip3 install --upgrade pip -q
+PIP_BREAK=""
+if python3 -c "import sys; exit(0 if sys.platform=='darwin' else 1)" 2>/dev/null; then
+    PIP_BREAK="--break-system-packages"
+fi
 
 if [[ "$MODE" == "fast" || "$MODE" == "full" ]]; then
     log "安装依赖（清华镜像）..."
-    pip3 install -r requirements.txt -i "$PIP_MIRROR" -q
+    pip3 install -r requirements.txt -i "$PIP_MIRROR" -q $PIP_BREAK
 else
     log "安装全部依赖..."
-    pip3 install -r requirements.txt -i "$PIP_MIRROR"
-    pip3 install huggingface_hub -i "$PIP_MIRROR" -q
+    pip3 install -r requirements.txt -i "$PIP_MIRROR" $PIP_BREAK
+    pip3 install huggingface_hub -i "$PIP_MIRROR" -q $PIP_BREAK
 fi
 
 log "依赖安装完成"

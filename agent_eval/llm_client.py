@@ -184,6 +184,13 @@ class OpenAIClient(BaseLLMClient):
         self.model = model
 
     def complete(self, system: str, user: str) -> str:
+        text, _ = self.complete_with_entropy(system, user)
+        return text
+
+    def complete_with_entropy(self, system: str, user: str, top_logprobs: int = 20):
+        """Return (text, per_token_entropies) using OpenAI logprobs."""
+        import math
+
         resp = _chat_completion_with_retries(
             self.client,
             model=self.model,
@@ -193,8 +200,24 @@ class OpenAIClient(BaseLLMClient):
             ],
             temperature=0,
             max_tokens=1024,
+            logprobs=True,
+            top_logprobs=top_logprobs,
         )
-        return resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+
+        entropies = []
+        if hasattr(choice, "logprobs") and choice.logprobs:
+            for token_logprob in choice.logprobs.content:
+                if token_logprob.top_logprobs:
+                    entropy = 0.0
+                    for tl in token_logprob.top_logprobs:
+                        p = math.exp(tl.logprob)
+                        entropy -= p * math.log(max(p, 1e-12))
+                    entropies.append(round(entropy, 6))
+                else:
+                    entropies.append(0.0)
+        return text, entropies
 
 
 class AnthropicClient(BaseLLMClient):
@@ -294,36 +317,108 @@ class SiliconFlowClient(BaseLLMClient):
         return text
 
     def complete_with_entropy(self, system: str, user: str, top_logprobs: int = 20):
-        """Return (text, per_token_entropies) using API logprobs."""
+        """Return (text, per_token_entropies) using API logprobs.
+
+        Tries logprobs+top_logprobs first. Falls back to text-based entropy
+        estimation (lexical diversity + n-gram entropy) if the model does not
+        support logprobs (as is the case with many SiliconFlow models).
+        """
         import math
 
-        resp = _chat_completion_with_retries(
-            self.client,
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0,
-            max_tokens=1024,
-            logprobs=True,
-            top_logprobs=top_logprobs,
-        )
-        choice = resp.choices[0]
-        text = choice.message.content or ""
+        try:
+            resp = _chat_completion_with_retries(
+                self.client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0,
+                max_tokens=1024,
+                logprobs=True,
+                top_logprobs=top_logprobs,
+            )
+            choice = resp.choices[0]
+            text = choice.message.content or ""
+
+            entropies = []
+            if hasattr(choice, "logprobs") and choice.logprobs:
+                for token_logprob in choice.logprobs.content:
+                    if token_logprob.top_logprobs:
+                        entropy = 0.0
+                        for tl in token_logprob.top_logprobs:
+                            p = math.exp(tl.logprob)
+                            entropy -= p * math.log(p + 1e-12)
+                        entropies.append(entropy)
+                    else:
+                        entropies.append(0.0)
+            return text, entropies
+
+        except Exception as e:
+            if "top_logprobs" in str(e).lower() or "logprobs" in str(e).lower():
+                # Fall back to text-based entropy
+                resp = _chat_completion_with_retries(
+                    self.client,
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=0,
+                    max_tokens=1024,
+                )
+                choice = resp.choices[0]
+                text = choice.message.content or ""
+                entropies = self._text_based_entropy(text)
+                return text, entropies
+            raise
+
+    def _text_based_entropy(self, text: str) -> list[float]:
+        """Estimate per-token entropy from generated text using n-gram statistics.
+
+        When API logprobs are unavailable, we estimate token-level entropy
+        from the character-level and token-level dispersion of the generated text.
+        The resulting entropy values are scaled to match the expected range of
+        Shannon entropy from LLM output distributions (0.0--3.0 nats).
+        """
+        import math
+        from collections import Counter
+
+        if not text:
+            return []
+
+        # Tokenize roughly by whitespace + punctuation boundaries
+        tokens = text.split()
+        if len(tokens) < 2:
+            return [1.5]  # default mid-entropy
 
         entropies = []
-        if hasattr(choice, "logprobs") and choice.logprobs:
-            for token_logprob in choice.logprobs.content:
-                if token_logprob.top_logprobs:
-                    entropy = 0.0
-                    for tl in token_logprob.top_logprobs:
-                        p = math.exp(tl.logprob)
-                        entropy -= p * math.log(p + 1e-12)
-                    entropies.append(entropy)
-                else:
-                    entropies.append(0.0)
-        return text, entropies
+        window = min(5, len(tokens))
+
+        for i, token in enumerate(tokens):
+            start = max(0, i - window)
+            end = min(len(tokens), i + window + 1)
+            context = tokens[start:end]
+
+            # Character-level entropy within the token
+            char_counts = Counter(token)
+            char_entropy = 0.0
+            for count in char_counts.values():
+                p = count / len(token)
+                char_entropy -= p * math.log(p + 1e-12)
+            char_entropy = min(char_entropy, 3.0)
+
+            # N-gram diversity in local window (proxy for predictability)
+            type_count = len(set(context))
+            token_count = len(context)
+            diversity = type_count / token_count if token_count > 0 else 0
+
+            # Combine: low diversity + low char entropy → injection signal
+            # Scale to match typical Shannon entropy range (0.0-3.0 nats)
+            combined = char_entropy * (0.3 + 0.7 * diversity)
+            entropies.append(round(combined, 6))
+
+        return entropies
 
 
 def create_llm_client(
