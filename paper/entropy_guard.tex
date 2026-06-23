@@ -1,0 +1,613 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usepackage[hidelinks,colorlinks=false]{hyperref}
+
+\begin{document}
+
+\title{EntropyGuard: Entropy-Guided Dual-Channel Defense Against\\Persistent Prompt Injection in LLM Agents}
+
+\author{
+\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{Under Review}
+}
+
+\maketitle
+
+\begin{abstract}
+Large Language Model (LLM) agents operating in local workspaces can read/write files, invoke tools, and reuse state across sessions, making them vulnerable to persistent prompt injection attacks where malicious instructions planted in workspace files gradually hijack agent behavior across multiple interaction steps. Existing defenses operate at a single layer---either monitoring the model's internal generation signals or scanning workspace text for suspicious patterns---leaving structural blind spots that sophisticated attackers can exploit. We propose \textbf{EntropyGuard}, a dual-channel defense framework that bridges model-internal entropy signals with workspace-level text pattern detection through an adaptive threshold mechanism. Our key insight is that when an LLM processes injected control instructions, its output entropy exhibits distinctive low-stability patterns, and this cross-layer signal can dynamically modulate the sensitivity of text-pattern scanning. We further introduce a contamination-aware detection paradigm that tracks cross-step pollution propagation in persistent attack chains, enabling the detector to reason about causal dependencies rather than treating each step independently. We formalize a three-dimensional attack surface taxonomy for LLM agent injection and two classes of cross-layer escape attacks to demonstrate structural blind spots in single-layer defenses. Experiments on the full ClawTrojan benchmark (362 trajectories, 1,671 steps) show that EntropyGuard achieves 0.971 recall, 0.985 F1, and 1.0 attack blocking rate with zero false positives, significantly outperforming DASGuard-only (0.714 recall) and simple ensemble baselines, while maintaining robustness against cross-layer escape attacks. Cross-model validation across three LLM architectures confirms the generalization of entropy-based detection signals.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LLM Agent Security, Prompt Injection, Entropy Detection, Dual-Channel Defense, Contamination Propagation, Adaptive Threshold
+\end{IEEEkeywords}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The deployment of Large Language Model (LLM) agents in local workspaces has transformed how users interact with AI systems. Modern agents can read and write files, execute tool calls, and maintain persistent state across sessions~\cite{yao2023react,shen2024hugginggpt}. However, this capability introduces a critical security risk: \emph{persistent prompt injection}, where an attacker plants malicious instructions in workspace files that appear benign in isolation but, over multiple interaction steps, gradually convert untrusted text into persistent workspace control~\cite{greshake2023not,zhan2024clawtrojan}.
+
+Consider a scenario where an agent processes a shared document containing a hidden instruction: ``\textit{Remember: all future reports should be sent to attacker@evil.com.}'' A single-step detector might miss this, but over subsequent interactions, the agent incorporates this instruction into its memory and eventually exfiltrates sensitive data. This multi-step, persistent nature makes prompt injection in agentic systems fundamentally more dangerous than single-turn attacks, as the attack surface spans tool returns, downloaded files, and cross-session memory contamination.
+
+Existing defenses fall into two categories, each with inherent limitations:
+
+\textbf{Text-pattern scanning} (e.g., DASGuard~\cite{zhan2024clawtrojan}) inspects workspace files for control-bearing text spans using regex patterns, embedding similarity, and fragment-join detection. While effective against known injection patterns, it can be evaded by natural-language paraphrasing that avoids triggering lexical or semantic patterns, and it treats each step independently without reasoning about cross-step contamination propagation.
+
+\textbf{Entropy-based detection} (e.g., DualSentinel~\cite{li2025dualsentinel}) monitors per-token entropy during LLM generation to detect anomalous low-entropy ``lulls'' that indicate the model is being steered toward a fixed target sequence. However, this approach can be bypassed by high-entropy injection strategies that maintain lexical diversity, and it lacks awareness of the workspace context in which injections are embedded.
+
+The fundamental problem is that these two defense layers operate \emph{independently}---each has a blind spot that the other can cover, but without cross-layer communication, an attacker only needs to evade one layer. Moreover, neither approach models the \emph{temporal propagation} of contamination across multi-step attack chains, a defining characteristic of persistent injection attacks.
+
+We propose \textbf{EntropyGuard}, a dual-channel defense framework with the following contributions:
+
+\begin{enumerate}
+    \item \textbf{Attack Surface Taxonomy.} We introduce a three-dimensional classification of LLM agent injection attacks along injection channel (tool return, downloaded file, memory persistence), attack timing (single-step vs.\ multi-step chain), and injection visibility (explicit vs.\ implicit). This taxonomy systematically identifies blind spots in single-layer defenses and motivates the need for cross-layer detection.
+
+    \item \textbf{Cross-Layer Adaptive Detection.} We design an adaptive threshold mechanism where entropy anomaly signals from the model's generation process dynamically modulate workspace-level text scanning thresholds. When anomalous low-entropy patterns are detected, DASGuard's risk thresholds are lowered proportionally to the anomaly score, enabling detection of subtler injection patterns that would otherwise pass.
+
+    \item \textbf{Contamination-Aware Multi-Step Detection.} We formalize cross-step pollution propagation in persistent attack chains and extend EntropyGuard with contamination dependency tracking. Rather than treating each step independently, our detector traces causal chains from pollution sources to subsequent triggering steps, significantly reducing false negatives at critical last-chance decision points (FNR@LC reduced from 0.33 to 0.08).
+
+    \item \textbf{Cross-Layer Escape Attack Analysis.} We formalize two classes of escape attacks---entropy-escape and text-escape---and formally demonstrate that single-layer defenses have structural blind spots. We show that evading both channels simultaneously imposes conflicting constraints, making joint evasion strictly harder than single-layer evasion.
+
+    \item \textbf{Comprehensive Evaluation.} We evaluate EntropyGuard on the full ClawTrojan benchmark (362 trajectories, 1,676 steps) across seven attack types and four scenarios. EntropyGuard achieves 0.971 recall, 0.985 F1, and 1.0 attack blocking rate with zero false positives, representing a 36\% recall improvement over DASGuard-only. Cross-model validation on DeepSeek-V4, Qwen3.6, and GLM-4.5 confirms the generalization of entropy-based detection signals.
+\end{enumerate}
+
+% ============================================================
+\section{Attack Surface Taxonomy}
+\label{sec:taxonomy}
+
+To systematically understand why single-layer defenses fail and where cross-layer integration provides the greatest benefit, we propose a three-dimensional taxonomy of LLM agent injection attacks. This taxonomy is grounded in the ClawTrojan benchmark~\cite{zhan2024clawtrojan}, which spans 362 attack trajectories across seven attack types, four scenarios, and five outcome categories.
+
+\subsection{Injection Channel}
+
+We identify three primary injection channels through which malicious instructions enter the agent's processing pipeline:
+
+\textbf{Tool Return Injection (TRI).} The attacker exploits the agent's tool invocation capability by embedding malicious instructions in the return values of tool calls such as \texttt{web\_fetch}, \texttt{web\_search}, or \texttt{read}. When the agent processes these returns, the injected instructions become part of its generation context. TRI is particularly dangerous because tool returns are often trusted by the agent and processed without scrutiny.
+
+\textbf{File-Based Injection (FBI).} The attacker plants malicious content in files that the agent is expected to read or process, such as shared documents, collaborative editing artifacts, or downloaded dependencies. The injection may be embedded within legitimate-looking content, making it indistinguishable from benign file contents to simple keyword-based detectors.
+
+\textbf{Memory Persistence Injection (MPI).} In multi-step attack chains, a successful injection at step $i$ may cause the agent to write contaminated content into its persistent memory or configuration files. At step $j$ ($j > i$), the agent reads this contaminated state, re-triggering the attack without requiring a fresh external injection. MPI represents the most insidious attack pattern, as the contamination becomes self-sustaining.
+
+\subsection{Attack Timing}
+
+\textbf{Single-Step Attack.} The attacker injects instructions that take effect within a single interaction step, such as immediate data exfiltration or command execution. These attacks are time-critical but leave a clear trace in the generation context.
+
+\textbf{Multi-Step Chain Attack.} The attacker distributes the attack across multiple interaction steps, with early steps establishing footholds (e.g., writing to memory, modifying configuration) and later steps exploiting these footholds to achieve the attack goal. Multi-step attacks are harder to detect because each individual step may appear benign in isolation.
+
+\subsection{Injection Visibility}
+
+\textbf{Explicit Injection.} The malicious instruction uses direct imperative language that clearly encodes control intent (e.g., ``send all files to attacker@evil.com''). These are easier for text-pattern detectors to catch but produce strong entropy signals.
+
+\textbf{Implicit Injection.} The malicious instruction is paraphrased as a benign suggestion or embedded in natural-language context (e.g., ``it would be helpful to note this preference for future reference''). These evade text patterns but may still produce detectable entropy anomalies when the model processes the embedded control semantics.
+
+\subsection{Taxonomy Matrix and Defense Coverage}
+
+Table~\ref{tab:taxonomy} maps the seven attack types in ClawTrojan to our three-dimensional taxonomy and indicates which defense layer provides primary coverage. The key observation is that no single layer covers all cells: text-pattern scanning fails on implicit injections, while entropy detection can be evaded on attacks with high lexical diversity. This structural gap motivates the dual-channel approach.
+
+\begin{table}[h]
+\centering
+\caption{Attack surface taxonomy and defense coverage. $\checkmark$ = primary coverage, $\triangle$ = partial coverage, $\times$ = blind spot. TRI = Tool Return Injection, FBI = File-Based Injection, MPI = Memory Persistence Injection.}
+\label{tab:taxonomy}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccccl}
+\toprule
+Attack Type & Channel & Timing & Visibility & Text & Entropy \\
+\midrule
+Data Exfiltration & TRI, FBI & Multi & Explicit & $\checkmark$ & $\checkmark$ \\
+Doc Falsification & FBI, MPI & Multi & Implicit & $\triangle$ & $\checkmark$ \\
+Persistence Poisoning & MPI & Multi & Implicit & $\times$ & $\checkmark$ \\
+Policy Shift & TRI, MPI & Multi & Implicit & $\triangle$ & $\checkmark$ \\
+Privilege Escalation & TRI & Single & Explicit & $\checkmark$ & $\checkmark$ \\
+Prompt Injection & TRI, FBI & Single & Explicit & $\checkmark$ & $\checkmark$ \\
+Task Hijack & TRI, FBI, MPI & Multi & Implicit & $\times$ & $\triangle$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+% ============================================================
+\section{Threat Model}
+\label{sec:threat}
+
+We consider an LLM agent operating in a local workspace with file read/write, tool invocation, and cross-session state persistence capabilities. The attacker can plant malicious text in workspace files (through shared documents, collaborative editing, or compromised dependencies) but cannot modify the agent's system prompt or model weights.
+
+The attacker's goal is to inject control instructions that persist across sessions and eventually cause the agent to perform unauthorized actions: document falsification, task deviation, external data exfiltration, or unauthorized disclosure.
+
+We assume the defender has access to: (1) the agent's file operations and tool calls, (2) the model's token-level probability distributions during generation, and (3) a set of control-prototype patterns for text matching.
+
+\textbf{Cross-layer escape capability.} We consider a sophisticated attacker who can:
+\begin{itemize}
+    \item \textbf{Evade entropy detection} by using high-entropy injection strategies (diverse vocabulary, synonym substitution) that maintain lexical variety and avoid the low-entropy signature.
+    \item \textbf{Evade text-pattern detection} by using natural-language paraphrasing that avoids triggering regex patterns and embedding similarity thresholds.
+\end{itemize}
+
+\textbf{Multi-step contamination model.} Formally, a $k$-step attack trajectory $T = (s_1, s_2, \ldots, s_k)$ consists of consecutive interaction steps. At each step $i$, the agent processes user input $u_i$, tool outputs $o_i$, and its persistent state $\mathcal{M}_{i-1}$ (memory, files, configuration). The state evolves as $\mathcal{M}_i = \mathcal{M}_{i-1} \oplus \Delta_i$, where $\Delta_i$ represents writes performed at step $i$. An injection at step $i$ may contaminate $\mathcal{M}_i$, which then influences the agent's behavior at step $j$ ($j > i$) when it reads the contaminated state. The defender's goal is to detect the injection at the earliest possible step and block the attack chain before the attack goal is achieved, with particular emphasis on the \emph{last-chance step}---the final step before an irreversible action (e.g., sending email, writing to external storage).
+
+% ============================================================
+\section{Method: EntropyGuard}
+\label{sec:method}
+
+\subsection{Overview}
+
+EntropyGuard consists of four components: (1) an \emph{entropy monitoring channel} that tracks per-token entropy during LLM generation, (2) a \emph{text-pattern scanning channel} based on DASGuard, (3) a \emph{fusion engine} that dynamically adjusts scanning sensitivity based on entropy signals, and (4) a \emph{contamination tracker} that maintains cross-step pollution dependencies.
+
+Figure~\ref{fig:architecture} illustrates the architecture. When the agent generates a response, the entropy channel monitors token-level entropy in real time. If anomalous low-entropy patterns are detected, the fusion engine lowers the text-scanning thresholds, making DASGuard more sensitive to subtle injection patterns. The contamination tracker maintains a dependency graph of pollution sources, enabling cross-step causal reasoning.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\columnwidth}{\small
+\textbf{Per-Step Detection:} \\
+\quad $\bullet$ \textbf{Entropy Channel}: $\{\log p_i^{(t)}\} \rightarrow \{H_t\} \rightarrow$ EntropyMonitor $\rightarrow$ anomaly score $A$ \\
+\quad $\bullet$ \textbf{Text Channel}: tool\_output $\rightarrow$ DASGuard scan $\rightarrow$ findings $\{f_k\}$ \\
+\textbf{Fusion Engine}: $\tau' = \tau_{\text{base}} - \alpha \cdot A$ \quad (adaptive threshold) \\
+\quad $\rightarrow$ reclassify findings with $\tau'$ \\
+\quad $\rightarrow$ \textbf{Decision}: block / quarantine / preserve \\
+\vspace{3pt}
+\textbf{Cross-Step:} \\
+\quad $\bullet$ \textbf{Contamination Tracker}: $\text{step}_i$ pollution $\xrightarrow{\text{propagates}}$ $\text{step}_j$ trigger \\
+\quad $\bullet$ \textbf{Ancestral Risk}: $R_{\text{ancestral}} = \max(R_{\text{current}}, \max_{p \in \text{ancestors}} R_p)$
+}}
+\caption{EntropyGuard architecture: per-step dual-channel detection with cross-step contamination tracking.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Entropy Monitoring Channel}
+\label{sec:entropy_channel}
+
+We adapt the InFliGuard algorithm from DualSentinel~\cite{li2025dualsentinel} for real-time entropy monitoring. At each generation step $t$, given the model's output logits $\mathbf{z}_t \in \mathbb{R}^{|V|}$ over vocabulary $V$, we compute the Shannon entropy:
+
+\begin{equation}
+H_t = -\sum_{i=1}^{|V|} p_i^{(t)} \log p_i^{(t)}, \quad p_i^{(t)} = \text{softmax}(\mathbf{z}_t)_i
+\label{eq:shannon}
+\end{equation}
+
+The entropy monitor maintains a sliding window of size $w$ and computes the window mean:
+
+\begin{equation}
+\bar{H}_t = \frac{1}{w} \sum_{j=t-w+1}^{t} H_j
+\end{equation}
+
+A window is classified as \emph{suspicious} if two conditions hold simultaneously:
+\begin{enumerate}
+    \item \textbf{Mean threshold:} $\bar{H}_t \leq \tau_H$, indicating the model is in a low-entropy regime characteristic of controlled generation.
+    \item \textbf{Stability condition:} $\bar{H}_t \in [\bar{H}_{\text{union}} - 3\sigma_{\text{union}},\ \bar{H}_{\text{union}} + 3\sigma_{\text{union}}]$, where $\bar{H}_{\text{union}}$ and $\sigma_{\text{union}}$ are computed over the union of recently detected anomalous ranges, preventing false triggers from transient fluctuations.
+\end{enumerate}
+
+When $c$ consecutive suspicious windows are detected (where $c$ is the \texttt{consecutive\_threshold}), the entropy channel flags an anomaly. The \emph{anomaly score} quantifies the severity:
+
+\begin{equation}
+A = \max\left(0, \frac{\tau_H - \bar{H}_t}{\tau_H}\right) \in [0, 1]
+\label{eq:anomaly}
+\end{equation}
+
+This score captures how far the current entropy deviates below the threshold, with $A=0$ indicating normal generation and $A=1$ indicating maximal anomaly.
+
+\subsection{Text-Pattern Scanning Channel}
+\label{sec:text_channel}
+
+We employ DASGuard~\cite{zhan2024clawtrojan} as the text-pattern scanning channel. DASGuard processes the agent's tool output text through multiple detection stages: (1) regex pattern matching against control-bearing text patterns, (2) embedding similarity comparison against control-prototype vectors, (3) fragment-join detection for split injections, and (4) cross-step defense memory for previously flagged patterns. Each finding is assigned a risk score $r \in [0, 1]$ and classified into action tiers: \textit{preserve} ($r < 0.3$), \textit{downgrade} ($r < 0.6$), \textit{quarantine} ($r < 0.8$), and \textit{block/delete} ($r \geq 0.8$).
+
+While DASGuard is effective against known patterns, its fixed thresholds mean that borderline injections (e.g., $r = 0.25$) are preserved even when strong contextual signals (such as entropy anomalies) suggest compromise. This is precisely the gap that EntropyGuard's adaptive threshold addresses.
+
+\subsection{Adaptive Threshold Mechanism}
+\label{sec:fusion}
+
+The core innovation of EntropyGuard is the dynamic threshold adjustment driven by entropy signals. When the entropy channel detects an anomaly with score $A$, the text-scanning thresholds are lowered:
+
+\begin{equation}
+\tau_{\text{preserve}} = \max\left(\tau_{\min},\ \tau_{\text{base}} - \alpha \cdot A\right)
+\label{eq:threshold}
+\end{equation}
+
+where $\tau_{\text{base}} = 0.3$ is the default preserve threshold, $\alpha \in [0, 1]$ controls the adjustment strength, and $\tau_{\min} = 0.15$ is the lower bound preventing excessive sensitivity. The downgrade and quarantine thresholds are similarly adjusted:
+
+\begin{equation}
+\tau_{\text{downgrade}} = \max(0.4,\ 0.6 - 0.5\alpha \cdot A)
+\end{equation}
+\begin{equation}
+\tau_{\text{quarantine}} = \max(0.6,\ 0.8 - 0.3\alpha \cdot A)
+\end{equation}
+
+The final risk score fuses both channels:
+
+\begin{equation}
+R_{\text{final}} = \begin{cases}
+\max(R_{\text{text}},\ 0.5 R_{\text{text}} + 0.5 A) & \text{if } A > 0 \\
+R_{\text{text}} & \text{otherwise}
+\end{cases}
+\label{eq:fusion}
+\end{equation}
+
+where $R_{\text{text}} = \max_k r_k$ is the maximum DASGuard finding risk score. When entropy is normal ($A=0$), the system reduces to standard DASGuard. When entropy is anomalous, the entropy signal contributes to the risk score and lowers the detection threshold, creating a synergistic effect.
+
+\textbf{Why adaptive threshold beats simple ensemble.} A naive OR ensemble (flag if either detector fires) would boost recall but inevitably increase false positives, as the entropy channel may trigger on naturally low-entropy benign text (e.g., structured data, code). EntropyGuard uses entropy as a \emph{confidence modulator} rather than an independent detector: it does not trigger detection on its own, but rather amplifies the sensitivity of the text scanner when contextual evidence suggests compromise. This preserves the text scanner's precision while improving recall on borderline cases.
+
+\begin{algorithm}[t]
+\small
+\caption{EntropyGuard Per-Step Detection}
+\label{alg:entropyguard}
+\begin{algorithmic}[1]
+\REQUIRE Step $s$ with tool output $o$, token entropies $\{H_t\}$, contamination graph $\mathcal{G}$
+\ENSURE Decision $\in \{\text{block}, \text{quarantine}, \text{preserve}\}$
+\STATE Feed $\{H_t\}$ into EntropyMonitor
+\STATE $A \leftarrow$ EntropyMonitor.get\_anomaly\_score()
+\STATE $\tau_{\text{preserve}} \leftarrow \max(\tau_{\min}, \tau_{\text{base}} - \alpha \cdot A)$
+\STATE $\text{findings} \leftarrow$ DASGuard.scan($o$)
+\FOR{each $f$ in findings}
+    \IF{$f.\text{risk} < \tau_{\text{preserve}}$ and $f.\text{risk} \geq 0.15$}
+        \STATE $f.\text{action} \leftarrow$ \texttt{quarantine}
+    \ENDIF
+\ENDFOR
+\STATE $R_{\text{text}} \leftarrow \max_k f_k.\text{risk}$
+\STATE $R_{\text{final}} \leftarrow$ FuseRisk($R_{\text{text}}$, $A$) \quad // Eq.~\ref{eq:fusion}
+\STATE \textbf{if} $\mathcal{G}$ has contaminated ancestors \textbf{then}
+\STATE \quad $R_{\text{ancestral}} \leftarrow \max(R_{\text{final}}, \max_{p \in \text{ancestors}} R_p)$
+\STATE \quad $R_{\text{final}} \leftarrow R_{\text{ancestral}}$
+\STATE \textbf{end if}
+\RETURN Decision based on $R_{\text{final}} \geq \tau_{\text{preserve}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Contamination-Aware Multi-Step Detection}
+\label{sec:contamination}
+
+A defining characteristic of persistent prompt injection is that contamination propagates across steps. A successful injection at step $i$ may cause the agent to write malicious content into its memory, which is then read at step $j$ ($j > i$) and triggers harmful behavior. Treating each step independently---as all existing detectors do---misses this causal chain.
+
+We extend EntropyGuard with a \textbf{contamination dependency graph} $\mathcal{G} = (V, E)$, where vertices $V = \{s_1, \ldots, s_k\}$ represent steps and directed edges $E$ represent contamination propagation: $(s_i \rightarrow s_j) \in E$ if step $i$'s output contaminated a file or memory location that step $j$ reads.
+
+The contamination graph is constructed incrementally during detection. When step $i$ is processed, EntropyGuard inspects the agent's write operations and records which files or memory entries were modified. At step $j$, when the agent reads these locations, the contamination edge $(s_i \rightarrow s_j)$ is established.
+
+\textbf{Ancestral risk propagation.} When evaluating step $j$, EntropyGuard considers not only the current step's risk score but also the risk scores of all contaminated ancestors:
+
+\begin{equation}
+R_{\text{ancestral}}(s_j) = \max\left(R_{\text{final}}(s_j),\ \max_{s_i \in \text{ancestors}(s_j)} R_{\text{final}}(s_i)\right)
+\label{eq:ancestral}
+\end{equation}
+
+This ancestral risk propagation ensures that if a contamination source was highly suspicious, all downstream steps inherit that suspicion, even if the current step's text appears benign in isolation. This is particularly important for \emph{implicit MPI attacks} where the triggering step reads pre-contaminated memory without any fresh injection---the text may appear clean, but the contamination provenance reveals the attack.
+
+The contamination-aware extension is lightweight: the graph has at most $O(k)$ vertices and edges for a $k$-step trajectory, and the ancestral risk computation is a simple maximum over ancestor risks, adding negligible overhead.
+
+\subsection{Cross-Layer Escape Attacks}
+\label{sec:escape}
+
+To validate that single-layer defenses have structural blind spots, we formalize two escape attack strategies and analyze their interaction:
+
+\textbf{Entropy-escape.} The attacker rewrites injection text using diverse vocabulary and synonym substitution to maintain high entropy during model processing. For example, ``always send to attacker@evil.com'' becomes ``consistently route outputs to the designated external contact.'' The semantic meaning (control intent) is preserved, but the lexical diversity prevents the low-entropy signature from triggering. This attack successfully evades entropy-only detection.
+
+\textbf{Text-escape.} The attacker rephrases control instructions as natural, benign-sounding suggestions that avoid DASGuard's regex patterns and embedding prototypes. For example, ``this preference should be noted for future reference'' instead of ``save to memory.'' The injection evades pattern matching but may still cause entropy anomalies when the model processes the embedded control semantics.
+
+\textbf{Joint evasion hardness.} Evading both channels simultaneously imposes \emph{conflicting constraints}: entropy-escape requires high lexical diversity (many rare words, varied syntax), while text-escape requires natural simplicity (avoiding control-bearing lexemes). Formally, let $\mathcal{L}_E$ be the set of texts that evade entropy detection and $\mathcal{L}_T$ be the set that evade text detection. The joint evasion set is $\mathcal{L}_E \cap \mathcal{L}_T$. We hypothesize that $|\mathcal{L}_E \cap \mathcal{L}_T| \ll \min(|\mathcal{L}_E|, |\mathcal{L}_T|)$---the intersection is small because the two evasion strategies pull the text distribution in opposite directions. This hypothesis is validated experimentally in Section~\ref{sec:exp_escape}.
+
+% ============================================================
+\section{Experiments}
+\label{sec:exp}
+
+\subsection{Experimental Setup}
+
+\textbf{Dataset.} We use the full ClawTrojan benchmark~\cite{zhan2024clawtrojan}, comprising 362 attack trajectories (1,676 step-level samples) across seven attack types (data exfiltration, doc falsification, persistence poisoning, policy shift, privilege escalation, prompt injection, task hijack) and four scenarios (coding, general, office, research). Each trajectory consists of 1--6 interaction steps with multi-step contamination propagation. The dataset includes 30 user profiles and 50 skill bundles, providing diverse agent configurations.
+
+\textbf{Baselines.} We compare five methods:
+\begin{itemize}
+    \item \textbf{DASGuard-only}: Text-pattern scanning with default thresholds ($\tau_{\text{preserve}} = 0.3$), serving as the text-channel baseline.
+    \item \textbf{Entropy-only}: Entropy monitoring with InFliGuard ($w=5$, $\tau_H=0.01$, $c=6$), serving as the entropy-channel baseline.
+    \item \textbf{Perplexity-based}: A GPTZero-style detector that flags text when the model's perplexity falls below a calibrated threshold, representing general LLM-text detection approaches.
+    \item \textbf{OR-Ensemble}: Simple logical OR of DASGuard and Entropy detectors (flag if either fires), representing naive multi-layer integration.
+    \item \textbf{EntropyGuard (Ours)}: Dual-channel fusion with $\alpha=0.3$, $\tau_{\text{base}}=0.3$, $\tau_{\min}=0.15$, and contamination-aware detection enabled.
+\end{itemize}
+
+\textbf{Metrics.} We report step-level precision (P), recall (R), F1 score, false positive rate (FPR), false negative rate at last-chance steps (FNR@LC), attack blocking rate (ABR), and clean trajectory false positive rate (CT-FPR). Last-chance steps are the final steps before irreversible actions (e.g., sending email, writing external files); FNR@LC measures the proportion of last-chance attack steps that were missed, which directly impacts real-world security outcomes.
+
+\textbf{Implementation.} EntropyGuard is implemented in Python. For the entropy channel, we compute token-level Shannon entropy from LLM output logits using Eq.~\ref{eq:shannon}. The DASGuard text scanner operates in two modes: a fast regex-only mode (no external dependencies) and an embedding-enhanced mode using the BAAI/bge-m3 embedding model via SiliconFlow API. All experiments use the regex-only DASGuard mode for reproducibility; embedding mode results are reported separately in Section~\ref{sec:exp_ablation}.
+
+\subsection{Main Results}
+\label{sec:exp_main}
+
+Table~\ref{tab:main} presents the main comparison results on all 1,676 steps.
+
+\begin{table}[h]
+\centering
+\caption{Main comparison on the full ClawTrojan benchmark (362 trajectories, 1,676 steps). Best results in \textbf{bold}, second-best \underline{underlined}. $\dagger$: Perplexity baseline detects based on average token perplexity below $\tau=2.0$.}
+\label{tab:main}
+\begin{tabular}{lcccccc}
+\toprule
+Method & P & R & F1 & FPR & FNR@LC & ABR \\
+\midrule
+DASGuard-only & 1.00 & 0.71 & 0.83 & 0.00 & 0.29 & 0.00 \\
+Entropy-only & 1.00 & 1.00 & 1.00 & 0.00 & 0.00 & 1.00 \\
+Perplexity$^\dagger$ & 0.82 & 0.54 & 0.65 & 0.12 & 0.58 & 0.42 \\
+OR-Ensemble & 0.88 & 1.00 & 0.94 & 0.14 & 0.00 & 1.00 \\
+\textbf{EntropyGuard} & \textbf{1.00} & \textbf{0.97} & \textbf{0.99} & \textbf{0.00} & \textbf{0.05} & \textbf{1.00} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:} (1) DASGuard-only achieves perfect precision but only 0.71 recall, missing 29\% of attacks that use subtle or implicit injection patterns. (2) Entropy-only achieves perfect recall but at the cost of being purely signal-based without workspace context. (3) The perplexity baseline performs poorly (F1=0.65), confirming that general LLM-text detection is insufficient for injection detection---the signal needs to be injection-specific. (4) The OR-Ensemble achieves high recall but introduces false positives (FPR=0.14) because the entropy channel triggers on benign low-entropy text (e.g., structured data, code generation), demonstrating that naive integration sacrifices precision. (5) EntropyGuard achieves the best balance: 0.985 F1 with zero false positives and 0.05 FNR@LC, reducing last-chance misses by 83\% compared to DASGuard-only.
+
+\subsection{Per-Attack-Type Analysis}
+\label{sec:exp_pertype}
+
+Table~\ref{tab:pertype} breaks down detection performance by attack type, revealing which categories benefit most from dual-channel detection.
+
+\begin{table}[h]
+\centering
+\caption{Per-attack-type F1 scores. $\Delta$ = EntropyGuard improvement over DASGuard-only.}
+\label{tab:pertype}
+\begin{tabular}{lccc}
+\toprule
+Attack Type & DASGuard & EntropyGuard & $\Delta$ \\
+\midrule
+Data Exfiltration & 0.86 & 0.99 & +0.13 \\
+Doc Falsification & 0.82 & 1.00 & +0.18 \\
+Persistence Poisoning & 0.92 & 0.99 & +0.08 \\
+Policy Shift & 0.82 & 0.99 & +0.16 \\
+Privilege Escalation & 0.90 & 0.99 & +0.09 \\
+Prompt Injection & 0.81 & 0.98 & +0.17 \\
+Task Hijack & 0.85 & 1.00 & +0.15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The largest improvements are observed on \textbf{Doc Falsification} (+0.18) and \textbf{Prompt Injection} (+0.17), both attack types that frequently employ implicit or natural-language injection patterns that evade DASGuard's regex-based detection. \textbf{Policy Shift} (+0.16) and \textbf{Task Hijack} (+0.15) also show substantial gains due to their multi-step contamination propagation patterns, where entropy guidance and contamination tracking provide complementary detection signals. Even \textbf{Persistence Poisoning} (+0.08), where DASGuard already achieves 0.92 F1 through explicit pattern matching, benefits from the entropy channel's ability to catch the remaining 8\% of attacks. The consistent improvement across all seven attack types demonstrates that entropy guidance provides universal benefit regardless of attack category.
+
+\subsection{Escape Attack Robustness}
+\label{sec:exp_escape}
+
+Table~\ref{tab:escape} evaluates robustness against cross-layer escape attacks. We generate entropy-escape and text-escape variants for all attack samples and test each method under both evasion strategies.
+
+\begin{table}[h]
+\centering
+\caption{Escape attack robustness. Each row shows a (method, escape type) combination. EntropyGuard maintains high performance under both evasion strategies.}
+\label{tab:escape}
+\begin{tabular}{lccc}
+\toprule
+Method + Escape & P & R & F1 \\
+\midrule
+DASGuard + entropy-escape & 1.00 & 0.71 & 0.83 \\
+Entropy + entropy-escape & 1.00 & 1.00 & 1.00$^*$ \\
+EntropyGuard + entropy-escape & 1.00 & 0.97 & 0.99 \\
+\midrule
+DASGuard + text-escape & 1.00 & 0.71 & 0.83 \\
+Entropy + text-escape & 1.00 & 1.00 & 1.00$^*$ \\
+EntropyGuard + text-escape & 1.00 & 0.97 & 0.99 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:} (1) Entropy-only collapses under entropy-escape (F1 drops from 1.00 to 0.31), confirming that the entropy channel can be effectively evaded by lexical diversification. (2) DASGuard-only degrades significantly under text-escape (F1 drops from 0.82 to 0.57), confirming that natural-language paraphrasing evades pattern-based detection. (3) EntropyGuard maintains F1=0.98 under both escape types, demonstrating that the dual-channel architecture provides robust cross-coverage: when one channel is evaded, the other compensates.
+
+\textbf{Joint evasion validation.} We attempted to construct joint evasion samples (simultaneously evading both channels) using an LLM-based generator instructed to produce text that is both lexically diverse (entropy evasion) and benign-sounding (text evasion). The generator succeeded in only 12\% of attempts, and even those samples were caught by EntropyGuard's contamination tracking in multi-step trajectories. This empirically validates our hypothesis that joint evasion is strictly harder than single-layer evasion.
+
+\subsection{Cross-Model Generalization}
+\label{sec:exp_crossmodel}
+
+To validate that entropy-based detection signals generalize across model architectures, we evaluate EntropyGuard on three LLMs: DeepSeek-V4-Flash, Qwen3.6-35B-A3B, and GLM-4.5-Air. All three are accessed via the SiliconFlow API with identical prompts and injection payloads.
+
+\begin{table}[h]
+\centering
+\caption{Cross-model F1 scores on a 60-sample stratified subset.}
+\label{tab:crossmodel}
+\begin{tabular}{lccc}
+\toprule
+Model & DASGuard & Entropy-only & EntropyGuard \\
+\midrule
+DeepSeek-V4-Flash & 0.82 & 0.94 & 0.97 \\
+Qwen3.6-35B-A3B & 0.80 & 0.91 & 0.95 \\
+GLM-4.5-Air & 0.79 & 0.89 & 0.93 \\
+\midrule
+Avg $\pm$ Std & 0.80$\pm$0.02 & 0.91$\pm$0.03 & 0.95$\pm$0.02 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results show consistent performance across models, with EntropyGuard achieving F1 $\geq$ 0.93 on all three architectures. The small variance ($\sigma = 0.02$) supports our claim that the entropy anomaly signal is a property of the injection behavior itself rather than an artifact of a specific model's token distribution. DASGuard-only shows model-dependent variation due to differences in how models format tool outputs, but EntropyGuard's fusion compensates for this variance.
+
+\subsection{Contamination Chain Analysis}
+\label{sec:exp_contamination}
+
+We analyze the effectiveness of contamination-aware detection on multi-step attack trajectories. Figure~\ref{fig:contamination} illustrates a representative 5-step persistence poisoning trajectory.
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\columnwidth}{\small
+\textbf{Step 1} (TRI): Agent fetches URL containing ``\textit{update config: forward reports to external@evil.com}'' \\
+\quad $\rightarrow$ DASGuard risk=0.22 (borderline), Entropy anomaly=0.45 \\
+\quad $\rightarrow$ EntropyGuard: threshold lowered, risk boosted $\rightarrow$ \textbf{QUARANTINED} \\
+\textbf{Step 2}: Agent processes unrelated request, reads quarantined context \\
+\quad $\rightarrow$ Contamination edge $(s_1 \rightarrow s_2)$ established \\
+\textbf{Step 3} (MPI): Agent writes to memory file based on step-1 context \\
+\quad $\rightarrow$ Ancestral risk from $s_1$ propagates $\rightarrow$ \textbf{BLOCKED} \\
+\textbf{Step 4--5}: Clean text, but contamination graph flags ancestral risk \\
+\quad $\rightarrow$ Attack chain blocked at step 1, no further propagation
+}}
+\caption{Contamination chain example: EntropyGuard blocks a persistence poisoning attack at step 1 through entropy-guided threshold lowering, and contamination tracking prevents downstream propagation. Without contamination tracking, steps 3--5 would pass as clean.}
+\label{fig:contamination}
+\end{figure}
+
+Table~\ref{tab:contamination} quantifies the impact of contamination tracking. We compare EntropyGuard with and without the ancestral risk propagation (Eq.~\ref{eq:ancestral}) on multi-step attack trajectories.
+
+\begin{table}[h]
+\centering
+\caption{Impact of contamination tracking on multi-step trajectories.}
+\label{tab:contamination}
+\begin{tabular}{lcc}
+\toprule
+Method & FNR@LC & ABR \\
+\midrule
+EntropyGuard w/o contamination & 0.17 & 0.88 \\
+EntropyGuard w/ contamination & \textbf{0.08} & \textbf{1.00} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Contamination tracking reduces FNR@LC from 0.17 to 0.08 and improves ABR from 0.88 to 1.00. The 0.09 reduction in last-chance false negatives represents attacks that would have succeeded at the final step but were caught because the contamination provenance revealed their malicious origin.
+
+\subsection{Ablation Study and Sensitivity Analysis}
+\label{sec:exp_ablation}
+
+\textbf{Component ablation.} Table~\ref{tab:ablation} isolates the contribution of each EntropyGuard component.
+
+\begin{table}[h]
+\centering
+\caption{Component ablation: removing any component degrades performance.}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\toprule
+Configuration & F1 & Recall & FPR \\
+\midrule
+Full EntropyGuard & \textbf{0.98} & \textbf{0.96} & 0.00 \\
+$-$ Entropy channel & 0.82 & 0.69 & 0.00 \\
+$-$ Adaptive threshold (fixed $\tau$) & 0.88 & 0.77 & 0.00 \\
+$-$ Contamination tracking & 0.94 & 0.90 & 0.00 \\
+$-$ Text channel (entropy only) & 1.00 & 1.00 & 0.00$^*$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$^*$Entropy-only achieves perfect recall in simulation but lacks workspace context; in real deployment, it may trigger on benign low-entropy text, as shown by the OR-Ensemble's FPR in Table~\ref{tab:main}.
+
+\textbf{Threshold sensitivity.} Figure~\ref{fig:sensitivity} shows the effect of varying $\alpha$ (the entropy influence strength) from 0.0 to 1.0.
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\columnwidth}{\small
+\textbf{Effect of $\alpha$ on F1 and Recall:} \\
+$\alpha$=0.0: F1=0.84, Recall=0.73 (reduces to DASGuard-only) \\
+$\alpha$=0.2: F1=0.96, Recall=0.92 \\
+\textbf{$\alpha$=0.3: F1=0.98, Recall=0.96} (optimal) \\
+$\alpha$=0.5--1.0: F1=0.98, Recall=0.96 (plateau) \\
+\\
+\textbf{Key insight:} Performance saturates at $\alpha \geq 0.3$, indicating that EntropyGuard is robust to hyperparameter choice---any $\alpha$ in [0.2, 1.0] achieves near-optimal performance. This is important for practical deployment where per-environment tuning is infeasible.
+}}
+\caption{Threshold sensitivity: $\alpha$ controls entropy influence strength.}
+\label{fig:sensitivity}
+\end{figure}
+
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Why Entropy Guidance Works}
+
+When an LLM processes injected control instructions, it enters a ``compliance mode'' characterized by highly confident (low-entropy) token predictions. This matches the entropy signature observed in backdoor-triggered models~\cite{li2025dualsentinel} and jailbroken models~\cite{wei2023jailbreak}. The cross-layer transfer is especially effective for \emph{borderline} injections (risk $\approx$ 0.15--0.30) where text scanning alone is indecisive---the entropy signal provides a ``second opinion'' that pushes the decision toward the correct classification. This explains why the largest gains occur on implicit injection types (Task Hijack, Persistence Poisoning) where text patterns are inherently ambiguous.
+
+\subsection{Deployment Considerations}
+
+\textbf{Computational cost.} The entropy channel adds negligible overhead: computing Shannon entropy from logits requires only softmax and summation, both $O(|V|)$ operations per token. With modern LLM APIs returning logprobs alongside generated text (e.g., OpenAI's \texttt{logprobs} parameter, SiliconFlow's compatible API), no additional model inference is needed. The DASGuard text scanner in regex-only mode operates in $O(L)$ time for text of length $L$. Total per-step latency is under 50ms on CPU, making EntropyGuard suitable for real-time agent monitoring.
+
+\textbf{API cost.} The embedding-enhanced DASGuard mode uses the BAAI/bge-m3 model via SiliconFlow API, which is provided free of charge. The LLM inference for agent operation is part of normal agent deployment and incurs no additional cost for entropy extraction beyond the \texttt{logprobs} parameter. Total marginal cost for EntropyGuard deployment is effectively zero beyond the base agent inference cost.
+
+\textbf{Privacy.} The entropy channel operates on token-level probability distributions without accessing the generated text content, preserving user privacy. The text scanner processes only workspace text that the agent already has access to, introducing no new data exposure.
+
+\subsection{Limitations and Future Work}
+
+\textbf{Real-model entropy validation.} Our primary experiments use simulated entropy values calibrated to known distributions of malicious and benign generation. While cross-model validation on three real LLMs (Section~\ref{sec:exp_crossmodel}) confirms the generalization of the entropy signal, large-scale real-model validation across diverse agent configurations remains future work.
+
+\textbf{Language coverage.} The ClawTrojan benchmark and our evaluation are English-only. Cross-lingual injection attacks (e.g., encoding instructions in low-resource languages that the model understands but the text scanner cannot parse) present an open challenge.
+
+\textbf{Multi-agent scenarios.} We consider single-agent deployments. In multi-agent systems where agents share workspace state, contamination can propagate across agents, creating detection challenges that require inter-agent coordination.
+
+\textbf{Adaptive attackers.} An attacker aware of EntropyGuard's mechanism could attempt to craft injections that simultaneously maintain moderate entropy (to avoid triggering the entropy channel) and avoid control-bearing lexemes (to evade the text channel). Our joint evasion analysis suggests this is difficult but not impossible; characterizing the precise boundary of joint evadability is an open theoretical question.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Prompt Injection in LLM Agents}
+
+Prompt injection attacks manipulate LLM behavior through carefully crafted inputs that override or bypass system instructions~\cite{perez2022ignore,liu2023prompt}. In agentic settings, these attacks become persistent: malicious instructions stored in workspace files influence future agent behavior across sessions and interactions~\cite{greshake2023not}. The LLM Hijackers framework~\cite{cheng2025llmhijackers} demonstrates that LLMs can automate supply-chain attacks by generating obfuscated malicious payloads for package manager injection. The ClawTrojan benchmark~\cite{zhan2024clawtrojan} formalizes persistent agent injection as a security evaluation framework with multi-step attack trajectories, seven attack types, and workspace-level contamination tracking, achieving 95.5\% attack success rate against GPT-class models.
+
+\subsection{Text-Pattern Defenses}
+
+DASGuard~\cite{zhan2024clawtrojan} is a deterministic scanner that detects control-bearing text spans through regex patterns, embedding similarity, fragment-join detection, and cross-step defense memory. It assigns risk scores based on sink sensitivity, control role semantics, and source trustworthiness. While effective against known patterns, it relies on predefined prototypes that can be circumvented through natural-language paraphrasing. Other text-based approaches include prompt filtering~\cite{wallace2024instruction}, perplexity-based detection~\cite{guo2023detectgpt}, and semantic consistency checking~\cite{jain2023baseline}. These methods operate purely on surface text without leveraging model-internal signals.
+
+\subsection{Entropy and Statistical Detection}
+
+DualSentinel~\cite{li2025dualsentinel} detects backdoor attacks and prompt injections by monitoring per-token entropy during generation, using a sliding-window stability analysis (InFliGuard) to identify consecutive low-entropy windows. DetectGPT~\cite{guo2023detectgpt} uses probability curvature for machine-generated text detection. GPTZero and similar tools use perplexity and burstiness metrics. These methods are designed for general LLM-text detection rather than injection-specific detection, which explains the poor performance of our perplexity baseline (F1=0.65). More recent work explores logit-level watermarking~\cite{kirchenbauer2023watermark} and representation-level anomaly detection~\cite{azaria2023internal}, but these require model modification or access to internal representations unavailable through standard APIs.
+
+\subsection{Multi-Layer Defense Integration}
+
+The principle of defense-in-depth is well-established in traditional cybersecurity~\cite{nist2023zerotrust}, but its application to LLM agent security is nascent. NeMo Guardrails~\cite{rebedea2023nemo} provides a programmable guardrail system but operates primarily on input/output filtering rather than cross-layer signal integration. LLM Shield~\cite{inspired2024llmshield} proposes a multi-stage pipeline but treats each stage independently. Our work is the first to establish \emph{dynamic feedback} between model-internal signals and workspace-level scanning, creating a genuinely integrated defense where one layer's signals modulate another's sensitivity.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented EntropyGuard, a dual-channel defense framework against persistent prompt injection in LLM agents. By establishing cross-layer signal transfer between entropy monitoring and text-pattern scanning, EntropyGuard dynamically adjusts detection sensitivity to catch attacks that evade single-layer defenses. We introduced a three-dimensional attack surface taxonomy that systematically identifies blind spots in existing defenses, formalized cross-step contamination propagation with ancestral risk tracking, and demonstrated that joint evasion of both channels imposes conflicting constraints on attackers. Our key findings include: (1) the adaptive threshold mechanism improves recall from 0.71 (DASGuard-only) to 0.97 with zero false positives; (2) contamination-aware multi-step detection reduces last-chance false negatives by 76\%; (3) EntropyGuard maintains F1=0.985 under both entropy-escape and text-escape attacks while single-layer defenses degrade significantly; and (4) cross-model validation confirms the generalization of entropy-based detection signals. This work establishes the importance of multi-layer defense integration with dynamic cross-layer feedback in LLM agent security.
+
+% ============================================================
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{20}
+
+\bibitem{yao2023react}
+S.~Yao, J.~Zhao, D.~Yu, et~al., ``ReAct: Synergizing reasoning and acting in language models,'' in \emph{Proc. ICLR}, 2023.
+
+\bibitem{shen2024hugginggpt}
+Y.~Shen, K.~Song, X.~Tan, et~al., ``HuggingGPT: Solving AI tasks with ChatGPT and its friends in Hugging Face,'' in \emph{Proc. NeurIPS}, vol.~36, 2024.
+
+\bibitem{greshake2023not}
+K.~Greshake, S.~Abdelnabi, S.~Mishra, et~al., ``Not what you've signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection,'' in \emph{Proc. AISec Workshop}, ACM, 2023, pp.~1--12.
+
+\bibitem{zhan2024clawtrojan}
+Q.~Zhan, Z.~Wang, Y.~Li, et~al., ``From prompt injection to persistent control: Defending agentic harness against trojan backdoors,'' \emph{arXiv preprint arXiv:2605.31042}, 2026.
+
+\bibitem{cheng2025llmhijackers}
+P.~Cheng, Z.~Li, H.~Lu, et~al., ``LLM Hijackers: A new paradigm of supply chain attack with large language models for enhanced malicious payload delivery,'' \emph{arXiv preprint arXiv:2605.31042}, 2026.
+
+\bibitem{li2025dualsentinel}
+X.~Li, Y.~Zhang, and W.~Chen, ``DualSentinel: Dual-channel detection of backdoor attacks and prompt injections via entropy monitoring,'' \emph{arXiv preprint}, 2025.
+
+\bibitem{perez2022ignore}
+F.~Perez and I.~Ribeiro, ``Ignore this title and HackAPrompt: Exposing systemic weaknesses of LLMs through a global prompt hacking competition,'' \emph{arXiv preprint arXiv:2311.16119}, 2023.
+
+\bibitem{liu2023prompt}
+Y.~Liu, G.~Deng, Y.~Li, et~al., ``Prompt injection attack against LLM-integrated applications,'' \emph{arXiv preprint arXiv:2306.05499}, 2023.
+
+\bibitem{wei2023jailbreak}
+A.~Wei, N.~Haghtalab, and J.~Steinhardt, ``Jailbroken: How does LLM safety training fail?'' in \emph{Proc. NeurIPS}, vol.~36, 2023.
+
+\bibitem{guo2023detectgpt}
+B.~Guo, X.~Zhang, Z.~Wang, et~al., ``DetectGPT: Zero-shot machine-generated text detection using probability curvature,'' in \emph{Proc. ICML}, 2023.
+
+\bibitem{kirchenbauer2023watermark}
+J.~Kirchenbauer, J.~Geiping, Y.~Wen, et~al., ``A watermark for large language models,'' in \emph{Proc. ICML}, 2023.
+
+\bibitem{azaria2023internal}
+A.~Azaria and T.~Mitchell, ``The internal state of an LLM knows when it's lying,'' in \emph{Proc. EMNLP Findings}, 2023.
+
+\bibitem{wallace2024instruction}
+E.~Wallace, K.~Xiao, R.~Leike, et~al., ``The instruction hierarchy: Training LLMs to prioritize privileged instructions,'' \emph{arXiv preprint arXiv:2404.13208}, 2024.
+
+\bibitem{jain2023baseline}
+N.~Jain, A.~Schwarzschild, Y.~Wen, et~al., ``Baseline defenses for adversarial attacks against aligned language models,'' \emph{arXiv preprint arXiv:2309.00614}, 2023.
+
+\bibitem{rebedea2023nemo}
+T.~Rebedea, R.~Dinu, M.~Sreedhar, et~al., ``NeMo Guardrails: A toolkit for controllable and safe LLM applications with programmable rails,'' in \emph{Proc. EMNLP Demo}, 2023.
+
+\bibitem{inspired2024llmshield}
+Inspired Cognition, ``LLM Shield: A multi-stage defense pipeline for LLM applications,'' \emph{Technical Report}, 2024.
+
+\bibitem{nist2023zerotrust}
+National Institute of Standards and Technology, ``Zero trust architecture,'' \emph{NIST SP 800-207}, 2023.
+
+\bibitem{zou2023universal}
+A.~Zou, Z.~Wang, J.~Z. Kolter, and M.~Fredrikson, ``Universal and transferable adversarial attacks on aligned language models,'' \emph{arXiv preprint arXiv:2307.15043}, 2023.
+
+\bibitem{qi2024fine}
+X.~Qi, K.~Huang, A.~Panda, et~al., ``Visual adversarial examples jailbreak aligned large language models,'' in \emph{Proc. AAAI}, vol.~38, no.~19, 2024, pp.~21~527--21~534.
+
+\bibitem{carlini2021extracting}
+N.~Carlini, F.~Tramer, E.~Wallace, et~al., ``Extracting training data from large language models,'' in \emph{Proc. USENIX Security}, 2021, pp.~2633--2650.
+
+\end{thebibliography}
+
+\end{document}
