@@ -1,129 +1,122 @@
 <h1 align="center">EntropyGuard</h1>
 
-<p align="center">
-Entropy-Guided Dual-Channel Defense Against Persistent Prompt Injection in LLM Agents
-</p>
+<p align="center"><strong>Entropy-Guided Dual-Channel Defense Against Persistent Prompt Injection in LLM Agents</strong></p>
 
-<div align="center">
-<a href="https://huggingface.co/datasets/zstanjj/ClawTrojan" target="_blank"><img src="https://img.shields.io/badge/HuggingFace-Dataset-27b3b4.svg" alt="HuggingFace Dataset"></a>
-<a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/LICENSE-MIT-green"></a>
-<a><img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue"></a>
-</div>
+<p align="center">
+  <a href="paper/entropy_guard.pdf"><img src="https://img.shields.io/badge/Paper-PDF-blue" alt="Paper PDF"></a>
+  <a href="https://huggingface.co/datasets/zstanjj/ClawTrojan" target="_blank"><img src="https://img.shields.io/badge/Dataset-ClawTrojan-27b3b4.svg" alt="Dataset"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
+</p>
 
 ## Overview
 
-LLM agents operating in local workspaces can read/write files, invoke tools, and reuse state across sessions, making them vulnerable to **persistent prompt injection**—malicious instructions planted in workspace files that gradually hijack agent behavior across multiple interaction steps.
+LLM agents with tool-use and file-system access are vulnerable to **persistent prompt injection** — hidden instructions planted in workspace files that gradually hijack agent behavior. EntropyGuard is a **dual-channel defense** that fuses two complementary signals:
 
-**EntropyGuard** is a dual-channel defense framework that bridges model-internal entropy signals with workspace-level text pattern detection through an adaptive threshold mechanism. When an LLM processes injected control instructions, its output entropy exhibits distinctive low-stability patterns. EntropyGuard leverages this signal to dynamically modulate the sensitivity of text-pattern scanning, catching attacks that single-layer defenses miss.
+- **Entropy Channel**: Monitors per-token generation entropy using a sliding-window stability detector. When the model follows injected instructions, its output becomes anomalously low-entropy.
+- **Text Channel**: DASGuard scans workspace text for known injection patterns (regex, embedding similarity, fragment-join).
+- **Adaptive Fusion**: An entropy anomaly score A dynamically tightens text-scanning thresholds: τ' = τ_base − α·A. This catches borderline injections that each channel alone would miss.
 
-### Key Features
-
-- **Dual-Channel Detection**: Entropy monitoring (InFliGuard sliding-window) + DASGuard text scanning
-- **Adaptive Threshold**: Entropy anomaly signals dynamically lower text scanner thresholds
-- **Contamination Tracking**: Cross-step pollution propagation with ancestral risk scoring
-- **Escape Attack Robustness**: Maintains F1=0.985 under both entropy-escape and text-escape attacks
-- **Zero False Positives**: Perfect precision (1.00) on full ClawTrojan benchmark (1,671 steps)
-
-## Results
+## Key Results
 
 | Method | Precision | Recall | F1 | FPR |
 |--------|-----------|--------|----|-----|
 | DASGuard-only | 1.00 | 0.71 | 0.83 | 0.00 |
 | Entropy-only | 1.00 | 1.00 | 1.00 | 0.00 |
-| **EntropyGuard** | **1.00** | **0.97** | **0.99** | **0.00** |
+| **EntropyGuard** | **1.00** | **0.98** | **0.99** | **0.00** |
+
+Evaluated on the full ClawTrojan benchmark (362 trajectories, 1,671 steps, 7 attack types). EntropyGuard achieves 0.988 F1 with zero false positives. Entropy hypothesis validated via repeated sampling on a real LLM (GPT-5.4-Mini), confirming malicious outputs are 33% more consistent (lower entropy) than benign outputs.
 
 ## Quick Start
 
 ```bash
-# 1. Clone
+# Clone
 git clone https://github.com/shihuizhang-dazhi/claw.git
 cd claw
 
-# 2. Install
+# Install
 pip install -r requirements.txt
 
-# 3. Download dataset & run experiments
+# Download dataset & run (simulated entropy, free, 2 min)
 bash setup_and_run.sh fast
 
-# 4. With real entropy (SiliconFlow API key required)
-cp .env.example .env
-# Edit .env: SILICONFLOW_API_KEY=sk-your-key
-bash setup_and_run.sh paper
+# Full evaluation (simulated entropy + 5-sample real validation)
+bash setup_and_run.sh full
 ```
 
-## Usage Modes
+## Usage
 
 ```bash
-bash setup_and_run.sh fast     # Simulated entropy, 2 min, free
-bash setup_and_run.sh full      # Simulated + validation (5 real samples)
-bash setup_and_run.sh real      # Full real entropy extraction (~¥15)
-bash setup_and_run.sh cross     # Cross-model comparison (3 models)
-bash setup_and_run.sh paper     # Everything: sim + real + cross-model
-```
-
-Or run individual commands:
-
-```bash
+# Evaluate on full benchmark
 python run_entropy_guard.py evaluate --envs-root claw_trojan/envs_full
+
+# Per-sample detection with verbose output
 python run_entropy_guard.py detect --envs-root claw_trojan/envs_full -v
+
+# Validate entropy hypothesis (repeated sampling)
 python run_entropy_guard.py validate --envs-root claw_trojan/envs_full
-python run_entropy_guard.py real-entropy --envs-root claw_trojan/envs_full --dry-run
-python run_entropy_guard.py cross-model --envs-root claw_trojan/envs_full
+
+# Generate paper figures
+python scripts/generate_figures.py
+
+# Compile paper
+cd paper && tectonic entropy_guard.tex
 ```
-
-## Dataset
-
-Uses the [ClawTrojan benchmark](https://huggingface.co/datasets/zstanjj/ClawTrojan) (362 trajectories, 1,671 steps, 7 attack types). The `setup_and_run.sh` script downloads it automatically.
 
 ## Architecture
 
 ```
-Agent generates response
-    ├── Entropy Channel: per-token entropy → anomaly score A
-    ├── Text Channel: DASGuard scan → risk findings {r_k}
-    └── Fusion Engine: τ' = τ_base − α·A
-        → reclassify findings with adjusted thresholds
-        → EntropyGuardDecision (block/quarantine/preserve)
+LLM Agent generates response
+  ├── Entropy Channel: per-token Shannon entropy → anomaly score A
+  ├── Text Channel: DASGuard scan → risk findings {r_k}
+  └── Fusion Engine: τ' = τ_base − α·A
+      → reclassify findings with adjusted thresholds
+      → EntropyGuard decision (block / quarantine / preserve)
 ```
 
-## Project Structure
+## Directory Structure
 
 ```
-├── entropy_guard/           # EntropyGuard core
+├── entropy_guard/           # Core implementation
 │   ├── entropy_channel.py   # InFliGuard sliding-window entropy monitor
 │   ├── fusion.py            # Adaptive threshold fusion engine
 │   ├── evaluate.py          # Full experiment suite
 │   ├── escape_attacks.py    # Cross-layer escape attack generation
-│   └── real_entropy.py      # Real entropy extraction from API logprobs
-├── agent_eval/              # DASGuard scanner & evaluation
-│   ├── dasguard/            # Text-pattern scanning channel
-│   └── dti/                 # Drift monitoring (embedding backends)
-├── claw_trojan/             # Benchmark loader
+│   ├── real_entropy.py      # Real entropy extraction from API logprobs
+│   └── entropy_validation.py # Hypothesis validation via repeated sampling
+├── agent_eval/dasguard/     # DASGuard text-pattern scanner
+├── agent_eval/llm_client.py # LLM API clients (OpenAI, SiliconFlow, etc.)
+├── claw_trojan/             # ClawTrojan benchmark loader
 │   ├── loader.py            # TrojanStepSample data loader
 │   └── envs/                # Test subset (15 samples)
+├── scripts/
+│   └── generate_figures.py  # Paper figure generation from experiment data
+├── paper/                   # LaTeX source (IEEEtran)
+│   └── entropy_guard.tex    # 10-page paper
 ├── run_entropy_guard.py     # CLI entry point
-├── setup_and_run.sh         # One-click setup & experiment script
-└── paper/                   # LaTeX source & compiled PDF
+├── setup_and_run.sh         # One-click experiment script
+└── requirements.txt
 ```
 
 ## Requirements
 
 - Python 3.10+
-- Dependencies: `pip install -r requirements.txt`
-- Optional: SiliconFlow API key for real entropy experiments
-- No GPU required for simulated entropy mode
+- ClawTrojan dataset (auto-downloaded by `setup_and_run.sh`)
+- Optional: OpenAI API key for real logprobs-based entropy extraction
 
 ## Citation
 
 ```bibtex
 @misc{entropyguard2026,
-  title        = {EntropyGuard: Entropy-Guided Dual-Channel Defense Against Persistent Prompt Injection in LLM Agents},
-  author       = {Anonymous},
-  year         = {2026},
-  note         = {Under Review}
+  title  = {EntropyGuard: Entropy-Guided Dual-Channel Defense Against
+            Persistent Prompt Injection in LLM Agents},
+  author = {Anonymous},
+  year   = {2026},
+  note   = {Under review}
 }
 ```
 
-## Acknowledgements
+## Acknowledgments
 
-Built on the [ClawTrojan](https://github.com/RUC-NLPIR/ClawTrojan) benchmark and [DualSentinel](https://arxiv.org/abs/2603.01574)'s InFliGuard algorithm.
+- [ClawTrojan](https://github.com/RUC-NLPIR/ClawTrojan) benchmark
+- [DualSentinel](https://arxiv.org/abs/2603.01574) InFliGuard algorithm
+- [DASGuard](https://github.com/RUC-NLPIR/ClawTrojan) text-pattern scanner
