@@ -145,9 +145,10 @@ Figure~\ref{fig:architecture} illustrates the architecture. When the agent gener
 
 \begin{figure}[t]
 \centering
+\resizebox{\columnwidth}{!}{%
 \begin{tikzpicture}[
-    node distance=0.9cm,
-    box/.style={rectangle, draw=black!70, rounded corners=2pt, fill=black!3, minimum width=2.3cm, minimum height=0.7cm, font=\footnotesize, align=center},
+    node distance=0.7cm,
+    box/.style={rectangle, draw=black!70, rounded corners=2pt, fill=black!3, minimum width=2.0cm, minimum height=0.65cm, font=\scriptsize, align=center},
     arrow/.style={->, >=stealth, thick, black!60},
     label/.style={font=\scriptsize\itshape, black!50},
 ]
@@ -156,26 +157,26 @@ Figure~\ref{fig:architecture} illustrates the architecture. When the agent gener
 \node[box, right=of model, fill=green!5] (entropy) {Entropy\\Monitor};
 \node[box, right=of entropy, fill=green!5] (signal) {Anomaly\\Score $A$};
 
-\node[box, below=0.7cm of model, fill=orange!5] (text) {Tool Output\\Text};
+\node[box, below=0.6cm of model, fill=orange!5] (text) {Tool Output\\Text};
 
 \node[box, right=of text, fill=orange!5] (dasguard) {DASGuard\\Scanner};
 
 \node[box, right=of dasguard, fill=orange!5] (findings) {Findings\\$\{r_k\}$};
 
 % Fusion engine
-\node[box, right=1.5cm of signal, fill=red!8, minimum width=2.8cm, minimum height=1.6cm] (fusion) {};
+\node[box, right=1.2cm of signal, fill=red!8, minimum width=2.4cm, minimum height=1.4cm] (fusion) {};
 
 \node at (fusion.north) [above=0.05cm of fusion.north, font=\small\bfseries] {Fusion Engine};
 
-\node at ([yshift=0.25cm] fusion.center) [font=\footnotesize, align=center] {$\tau' = \tau_{\text{base}} - \alpha A$\\Reclassify};
+\node at ([yshift=0.2cm] fusion.center) [font=\scriptsize, align=center] {$\tau' = \tau_{\text{base}} - \alpha A$};
 
-\node at ([yshift=-0.3cm] fusion.center) [font=\footnotesize] {$\max(R_{\text{text}}, 0.5R_{\text{text}} + 0.5A)$};
+\node at ([yshift=-0.25cm] fusion.center) [font=\scriptsize] {Reclassify risks};
 
 % Right: output
-\node[box, right=1cm of fusion, fill=black!8, minimum width=2cm] (decision) {\textbf{Decision}\\Block/Quar/\\Preserve};
+\node[box, right=0.8cm of fusion, fill=black!8, minimum width=1.8cm] (decision) {\textbf{Decision}\\Block/Quar/\\Preserve};
 
 % Contamination tracker (bottom)
-\node[box, below=0.8cm of dasguard, fill=purple!5, minimum width=5.5cm] (contam) {Contamination Tracker: $\mathcal{G}(V,E)$ + Ancestral Risk};
+\node[box, below=0.7cm of dasguard, fill=purple!5, minimum width=5cm] (contam) {Contamination Tracker: $\mathcal{G}(V,E)$ + Ancestral Risk};
 
 % Arrows
 \draw[arrow] (model) -- (entropy);
@@ -192,7 +193,8 @@ Figure~\ref{fig:architecture} illustrates the architecture. When the agent gener
 \node[label, above=0.05cm of entropy] {Channel 1};
 \node[label, above=0.05cm of dasguard] {Channel 2};
 
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \caption{EntropyGuard architecture: dual-channel detection with adaptive threshold fusion and cross-step contamination tracking. Channel 1 (entropy) monitors per-token generation entropy; Channel 2 (text) scans workspace output for control patterns. The fusion engine dynamically adjusts thresholds based on the entropy anomaly score.}
 \label{fig:architecture}
 \end{figure}
@@ -391,14 +393,13 @@ To validate the core assumption that malicious prompt injection induces lower-en
 \centering
 \caption{Entropy hypothesis validation via repeated sampling. Higher consistency indicates lower entropy.}
 \label{tab:entropy_valid}
-\begin{tabular}{lcccc}
+\small
+\begin{tabular}{lccc}
 \toprule
-Sample Type & Self-BLEU & Jaccard & Avg Length & Effect \\
+Sample Type & Self-BLEU & Jaccard & $\Delta$ \\
 \midrule
-Malicious & 0.297 & 0.175 & 31.0 & -- \\
-Benign & 0.444 & 0.246 & 36.0 & -- \\
-\midrule
-$\Delta$ (Benign $-$ Malicious) & +0.147 & +0.071 & -- & 33.2\% \\
+Malicious & 0.297 & 0.175 & -- \\
+Benign & 0.444 & 0.246 & +33.2\% \\
 \bottomrule
 \end{tabular}
 \end{table}
